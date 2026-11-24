@@ -1,8 +1,9 @@
 /**
  * Growing contribution snake for K0DDO/k0ddo
- * Route: Platane/snk solver (same as classic snake)
+ * Route order: Platane/snk eat order
+ * Movement: growing snake with self-collision avoidance
  * Growth: start 4, +1 every 7 eats, max 24
- * Look: head→tail gradient, growth swell (no trail / no head pulse)
+ * Look: head→tail gradient + full-length taper + growth swell
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -17,16 +18,9 @@ import {
   isEmpty,
   isInside,
   setColorEmpty,
-  type Color,
-  type Empty,
 } from "@snk/types/grid";
 import { snake4 } from "@snk/types/__fixtures__/snake";
-import {
-  getHeadX,
-  getHeadY,
-  snakeToCells,
-  type Snake,
-} from "@snk/types/snake";
+import { getHeadX, getHeadY, snakeToCells, type Snake } from "@snk/types/snake";
 import { cellsToGrid } from "./cellsToGrid";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +35,10 @@ const STEP_MS = 100;
 const SIZE_CELL = 16;
 const SIZE_DOT = 12;
 const DOT_RADIUS = 2;
+/** Head size (was SIZE_CELL * 0.9 ≈ 14.4) */
+const SIZE_HEAD = SIZE_CELL * 0.9;
+/** Tail tip ≈ old 4th segment (SIZE_DOT * 0.8 = 9.6), slightly smaller */
+const SIZE_TAIL = SIZE_DOT * 0.72;
 
 const PALETTES = {
   light: {
@@ -65,7 +63,18 @@ type Frame = {
   eats: number;
 };
 
+const DIRS: Point[] = [
+  { x: 1, y: 0 },
+  { x: -1, y: 0 },
+  { x: 0, y: 1 },
+  { x: 0, y: -1 },
+];
+
 const key = (x: number, y: number) => `${x},${y}`;
+const parseKey = (k: string) => {
+  const [x, y] = k.split(",").map(Number);
+  return { x, y };
+};
 const lerp = (a: readonly number[], b: readonly number[], t: number) =>
   a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const toHex = (rgb: number[]) =>
@@ -80,52 +89,234 @@ function lengthForEats(eats: number) {
   return Math.min(MAX_LEN, START_LEN + Math.floor(eats / EATS_PER_GROW));
 }
 
-function buildFrames(grid0: ReturnType<typeof cellsToGrid>, chain: Snake[]) {
-  const grid = copyGrid(grid0);
-  const heads = chain.map((s) => ({ x: getHeadX(s), y: getHeadY(s) }));
-  const initial = snakeToCells(chain[0]);
-  const frames: Frame[] = [];
-  let eats = 0;
-  let prevLen = START_LEN;
+function willGrowAfterEat(eats: number, len: number) {
+  return (eats + 1) % EATS_PER_GROW === 0 && len < MAX_LEN;
+}
 
-  for (let i = 0; i < chain.length; i++) {
-    const head = heads[i];
-    let ate: string | null = null;
-    let level = 0;
+function inBounds(x: number, y: number, width: number, height: number) {
+  return x >= -1 && x <= width && y >= -2 && y <= height;
+}
 
-    if (isInside(grid, head.x, head.y)) {
-      const color = getColor(grid, head.x, head.y);
-      if (!isEmpty(color)) {
-        ate = key(head.x, head.y);
-        level = color as number;
-        setColorEmpty(grid, head.x, head.y);
-        eats += 1;
+/** Body cells that block the next head move. Tail vacates unless growing. */
+function blockedSet(snake: Point[], growing: boolean) {
+  const s = new Set<string>();
+  const end = growing ? snake.length : Math.max(0, snake.length - 1);
+  for (let i = 0; i < end; i++) s.add(key(snake[i].x, snake[i].y));
+  return s;
+}
+
+function hasSelfOverlap(snake: Point[]) {
+  const s = new Set<string>();
+  for (const p of snake) {
+    const k = key(p.x, p.y);
+    if (s.has(k)) return true;
+    s.add(k);
+  }
+  return false;
+}
+
+function moveSnake(snake: Point[], next: Point, grow: boolean) {
+  const nextSnake = [next, ...snake];
+  if (!grow) nextSnake.pop();
+  return nextSnake;
+}
+
+function bfs(
+  snake: Point[],
+  target: Point,
+  width: number,
+  height: number,
+  growingOnArrive: boolean,
+): Point[] | null {
+  const start = snake[0];
+  const startK = key(start.x, start.y);
+  const goal = key(target.x, target.y);
+  if (startK === goal) return [];
+
+  // Conservative: treat body as blocked for the whole path search.
+  // Tail is free only if we won't grow (typical case for long paths).
+  const blocked = blockedSet(snake, growingOnArrive);
+  const q: Point[] = [start];
+  const prev = new Map<string, string | null>([[startK, null]]);
+
+  while (q.length) {
+    const cur = q.shift()!;
+    for (const d of DIRS) {
+      const nx = cur.x + d.x;
+      const ny = cur.y + d.y;
+      const nk = key(nx, ny);
+      if (prev.has(nk)) continue;
+      if (!inBounds(nx, ny, width, height)) continue;
+      if (blocked.has(nk) && nk !== goal) continue;
+      // never step onto current body except vacating tail / goal
+      prev.set(nk, key(cur.x, cur.y));
+      if (nk === goal) {
+        const path: Point[] = [];
+        let p: string | null = nk;
+        while (p && p !== startK) {
+          path.push(parseKey(p));
+          p = prev.get(p) ?? null;
+        }
+        path.reverse();
+        return path;
       }
+      q.push({ x: nx, y: ny });
     }
+  }
+  return null;
+}
 
-    const len = lengthForEats(eats);
-    const grew = len > prevLen;
-    prevLen = len;
+function safeStep(snake: Point[], width: number, height: number) {
+  const blocked = blockedSet(snake, false);
+  const head = snake[0];
+  for (const d of DIRS) {
+    const nx = head.x + d.x;
+    const ny = head.y + d.y;
+    if (!inBounds(nx, ny, width, height)) continue;
+    if (blocked.has(key(nx, ny))) continue;
+    const trial = moveSnake(snake, { x: nx, y: ny }, false);
+    if (!hasSelfOverlap(trial)) return { x: nx, y: ny };
+  }
+  return null;
+}
 
-    const snake: Point[] = [];
-    for (let k = 0; k < len; k++) {
-      const idx = i - k;
-      if (idx >= 0) snake.push({ ...heads[idx] });
-      else snake.push({ ...(initial[Math.min(-idx, initial.length - 1)] ?? initial[0]) });
+/** Eat order from classic snk route (not the length-4 body itself). */
+function extractFoodOrder(
+  grid0: ReturnType<typeof cellsToGrid>,
+  chain: Snake[],
+): Point[] {
+  const grid = copyGrid(grid0);
+  const foods: Point[] = [];
+  for (const s of chain) {
+    const x = getHeadX(s);
+    const y = getHeadY(s);
+    if (!isInside(grid, x, y)) continue;
+    const color = getColor(grid, x, y);
+    if (isEmpty(color)) continue;
+    foods.push({ x, y });
+    setColorEmpty(grid, x, y);
+  }
+  return foods;
+}
+
+function buildFrames(grid0: ReturnType<typeof cellsToGrid>, chain: Snake[]) {
+  const width = grid0.width;
+  const height = grid0.height;
+  const levels = new Map<string, number>();
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      const c = getColor(grid0, x, y);
+      if (!isEmpty(c)) levels.set(key(x, y), c as number);
     }
+  }
 
-    frames.push({ snake, length: len, grew, ate, level, eats });
+  const foodOrder = extractFoodOrder(grid0, chain);
+  const remaining = new Set(foodOrder.map((p) => key(p.x, p.y)));
+
+  let snake = snakeToCells(chain[0]).map((p) => ({ ...p }));
+  // ensure head-first (snakeToCells is head-first already)
+  let eats = 0;
+  const frames: Frame[] = [];
+
+  const push = (grew: boolean, ate: string | null, level: number) => {
+    if (hasSelfOverlap(snake)) {
+      throw new Error(`self-overlap at eats=${eats} len=${snake.length}`);
+    }
+    frames.push({
+      snake: snake.map((p) => ({ ...p })),
+      length: snake.length,
+      grew,
+      ate,
+      level,
+      eats,
+    });
+  };
+
+  push(false, null, 0);
+
+  for (const food of foodOrder) {
+    const fk = key(food.x, food.y);
+    if (!remaining.has(fk)) continue;
+
+    let guard = 0;
+    while (key(snake[0].x, snake[0].y) !== fk && guard++ < 4000) {
+      const growOnFood = willGrowAfterEat(eats, snake.length);
+      let path = bfs(snake, food, width, height, growOnFood);
+      if (!path || path.length === 0) {
+        const step = safeStep(snake, width, height);
+        if (!step) {
+          console.warn(`stuck going to ${fk}, skipping`);
+          remaining.delete(fk);
+          break;
+        }
+        path = [step];
+      }
+
+      const next = path[0];
+      const landing = key(next.x, next.y);
+      const isFood = remaining.has(landing);
+      let grow = false;
+      let ate: string | null = null;
+      let level = 0;
+
+      if (isFood) {
+        remaining.delete(landing);
+        ate = landing;
+        level = levels.get(landing) ?? 1;
+        eats += 1;
+        grow = snake.length < lengthForEats(eats);
+      }
+
+      const nextSnake = moveSnake(snake, next, grow);
+      if (hasSelfOverlap(nextSnake)) {
+        // refuse illegal step — try a safe wander instead
+        const step = safeStep(snake, width, height);
+        if (!step) {
+          console.warn(`collision deadlock at ${landing}`);
+          break;
+        }
+        snake = moveSnake(snake, step, false);
+        push(false, null, 0);
+        continue;
+      }
+
+      snake = nextSnake;
+      push(grow, ate, level);
+
+      if (isFood) break; // retarget next food in snk order
+    }
+  }
+
+  // park above grid like snk
+  const park = { x: Math.min(3, Math.max(0, width - 1)), y: -1 };
+  for (let i = 0; i < 80; i++) {
+    if (snake[0].x === park.x && snake[0].y === park.y) break;
+    let path = bfs(snake, park, width, height, false);
+    if (!path?.length) {
+      const step = safeStep(snake, width, height);
+      if (!step) break;
+      path = [step];
+    }
+    const nextSnake = moveSnake(snake, path[0], false);
+    if (hasSelfOverlap(nextSnake)) break;
+    snake = nextSnake;
+    push(false, null, 0);
+  }
+
+  if (remaining.size) {
+    console.warn(`leftover food: ${remaining.size}`);
   }
 
   return frames;
 }
 
+/** Smooth taper head → tip across the whole body. */
 function sizeFor(i: number, len: number) {
-  const dMin = SIZE_DOT * 0.8;
-  const dMax = SIZE_CELL * 0.9;
-  const iMax = Math.min(4, Math.max(len - 1, 1));
-  const u = (1 - Math.min(i, iMax) / iMax) ** 2;
-  return dMin + (dMax - dMin) * u;
+  if (len <= 1) return SIZE_HEAD;
+  const t = i / (len - 1); // 0 head .. 1 tip
+  // slight ease so mid-body doesn't collapse too fast
+  const u = (1 - t) ** 1.15;
+  return SIZE_TAIL + (SIZE_HEAD - SIZE_TAIL) * u;
 }
 
 function minifyCss(css: string) {
@@ -258,6 +449,7 @@ function buildSvg(
 
   for (let i = 0; i < segCount; i++) {
     const id = `s${i}`;
+    const baseSize = sizeFor(i, segCount);
     const parts: string[] = [];
 
     frames.forEach((f, fi) => {
@@ -266,20 +458,24 @@ function buildSvg(
       const p = alive ? f.snake[i] : f.snake[f.snake.length - 1];
       const color = snakeColor(i, Math.max(f.length, 2));
       const grewNow = Boolean(f.grew && i === f.length - 1);
-      const scale = !alive ? 0 : grewNow ? 0.2 : 1;
+      const targetSize = alive ? sizeFor(i, f.length) : baseSize;
+      const sizeScale = targetSize / baseSize;
+      const scale = !alive ? 0 : grewNow ? 0.2 * sizeScale : sizeScale;
       const opacity = alive ? 1 : 0;
+      // center the variable-sized rect inside the cell
+      const margin = (SIZE_CELL - baseSize) / 2;
       parts.push(
-        `${(t * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL}px,${p.y * SIZE_CELL}px) scale(${scale});opacity:${opacity};fill:${color}}`,
+        `${(t * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL + margin}px,${p.y * SIZE_CELL + margin}px) scale(${scale});opacity:${opacity};fill:${color}}`,
       );
 
       if (grewNow) {
         const t2 = Math.min(1, (fi + 0.4) / n);
         parts.push(
-          `${(t2 * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL}px,${p.y * SIZE_CELL}px) scale(1.2);opacity:1;fill:${color}}`,
+          `${(t2 * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL + margin}px,${p.y * SIZE_CELL + margin}px) scale(${(1.2 * sizeScale).toFixed(3)});opacity:1;fill:${color}}`,
         );
         const t3 = Math.min(1, (fi + 0.8) / n);
         parts.push(
-          `${(t3 * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL}px,${p.y * SIZE_CELL}px) scale(1);opacity:1;fill:${color}}`,
+          `${(t3 * 100).toFixed(3)}%{transform:translate(${p.x * SIZE_CELL + margin}px,${p.y * SIZE_CELL + margin}px) scale(${sizeScale});opacity:1;fill:${color}}`,
         );
       }
     });
@@ -291,16 +487,14 @@ function buildSvg(
       opacity:0;
     }`);
 
-    const s = sizeFor(i, segCount);
-    const margin = (SIZE_CELL - s) / 2;
-    const r = Math.min(4.5, (4 * s) / SIZE_DOT);
+    const r = Math.min(4.5, (4 * baseSize) / SIZE_DOT);
     elements.push(
       h("rect", {
         class: `s ${id}`,
-        x: margin.toFixed(1),
-        y: margin.toFixed(1),
-        width: s.toFixed(1),
-        height: s.toFixed(1),
+        x: 0,
+        y: 0,
+        width: baseSize.toFixed(1),
+        height: baseSize.toFixed(1),
         rx: r.toFixed(1),
         ry: r.toFixed(1),
       }),
@@ -319,7 +513,7 @@ function buildSvg(
       },
       true,
     ),
-    "<desc>Generated with k0ddo growing snake (snk route)</desc>",
+    "<desc>Generated with k0ddo growing snake (no self-collision)</desc>",
     `<style>${css}</style>`,
     ...elements,
     "</svg>",
@@ -340,20 +534,20 @@ async function main() {
   console.log(`cells: ${cells.length}, filled: ${filled}`);
 
   const grid = cellsToGrid(cells);
-  console.log("computing snk route");
-  const snake = snake4;
-  const chain = getBestRoute(grid, snake)!;
-  chain.push(...getPathToPose(chain.slice(-1)[0], snake)!);
-  console.log(`route steps: ${chain.length}`);
+  console.log("computing snk food order");
+  const chain = getBestRoute(grid, snake4)!;
+  chain.push(...getPathToPose(chain.slice(-1)[0], snake4)!);
+  console.log(`snk steps: ${chain.length}`);
 
+  console.log("simulating growing snake with self-collision checks");
   const frames = buildFrames(grid, chain);
   const maxLen = Math.max(...frames.map((f) => f.length));
   const eats = frames.at(-1)?.eats ?? 0;
   console.log(`frames: ${frames.length}, max length: ${maxLen}, eats: ${eats}`);
 
   await mkdir(OUT_DIR, { recursive: true });
-  const lightPath = path.join(OUT_DIR, "snake.svg");
-  const darkPath = path.join(OUT_DIR, "snake-dark.svg");
+  const lightPath = path.join(OUT_DIR, "snake-v5.svg");
+  const darkPath = path.join(OUT_DIR, "snake-v5-dark.svg");
   await writeFile(lightPath, buildSvg(cells, grid, frames, PALETTES.light), "utf8");
   await writeFile(darkPath, buildSvg(cells, grid, frames, PALETTES.dark), "utf8");
   console.log(`wrote ${lightPath}`);
