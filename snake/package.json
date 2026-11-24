@@ -1,0 +1,15 @@
+{
+  "name": "k0ddo-snake",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "vendor/*"
+  ],
+  "scripts": {
+    "generate": "tsx generate.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}
