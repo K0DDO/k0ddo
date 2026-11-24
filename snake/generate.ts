@@ -234,58 +234,78 @@ function buildFrames(grid0: ReturnType<typeof cellsToGrid>, chain: Snake[]) {
 
   push(false, null, 0);
 
-  for (const food of foodOrder) {
-    const fk = key(food.x, food.y);
-    if (!remaining.has(fk)) continue;
-
-    let guard = 0;
-    while (key(snake[0].x, snake[0].y) !== fk && guard++ < 4000) {
+  const stepToward = (food: Point): boolean => {
+    // Prefer optimistic path (tail vacates). If the next step is the food
+    // and we would grow, re-check with growing=true.
+    let path = bfs(snake, food, width, height, false);
+    if (path && path.length === 1) {
       const growOnFood = willGrowAfterEat(eats, snake.length);
-      let path = bfs(snake, food, width, height, growOnFood);
-      if (!path || path.length === 0) {
-        const step = safeStep(snake, width, height);
-        if (!step) {
-          console.warn(`stuck going to ${fk}, skipping`);
-          remaining.delete(fk);
-          break;
-        }
-        path = [step];
+      if (growOnFood) {
+        const strict = bfs(snake, food, width, height, true);
+        path = strict && strict.length ? strict : path;
       }
+    }
+    if (!path || path.length === 0) return false;
 
-      const next = path[0];
-      const landing = key(next.x, next.y);
-      const isFood = remaining.has(landing);
-      let grow = false;
-      let ate: string | null = null;
-      let level = 0;
+    const next = path[0];
+    const landing = key(next.x, next.y);
+    const isFood = remaining.has(landing);
+    let grow = false;
+    let ate: string | null = null;
+    let level = 0;
 
-      if (isFood) {
-        remaining.delete(landing);
-        ate = landing;
-        level = levels.get(landing) ?? 1;
-        eats += 1;
-        grow = snake.length < lengthForEats(eats);
-      }
+    if (isFood) {
+      remaining.delete(landing);
+      ate = landing;
+      level = levels.get(landing) ?? 1;
+      eats += 1;
+      grow = snake.length < lengthForEats(eats);
+    }
 
-      const nextSnake = moveSnake(snake, next, grow);
-      if (hasSelfOverlap(nextSnake)) {
-        // refuse illegal step — try a safe wander instead
-        const step = safeStep(snake, width, height);
-        if (!step) {
-          console.warn(`collision deadlock at ${landing}`);
-          break;
-        }
-        snake = moveSnake(snake, step, false);
-        push(false, null, 0);
+    const nextSnake = moveSnake(snake, next, grow);
+    if (hasSelfOverlap(nextSnake)) return false;
+
+    snake = nextSnake;
+    push(grow, ate, level);
+    return true;
+  };
+
+  const wander = (steps: number) => {
+    for (let i = 0; i < steps; i++) {
+      const step = safeStep(snake, width, height);
+      if (!step) return;
+      const nextSnake = moveSnake(snake, step, false);
+      if (hasSelfOverlap(nextSnake)) return;
+      snake = nextSnake;
+      push(false, null, 0);
+    }
+  };
+
+  const chaseFood = (food: Point) => {
+    const fk = key(food.x, food.y);
+    if (!remaining.has(fk)) return;
+
+    let retries = 0;
+    let guard = 0;
+    while (key(snake[0].x, snake[0].y) !== fk && guard++ < 5000) {
+      if (stepToward(food)) {
+        retries = 0;
+        if (!remaining.has(fk)) return; // eaten (maybe via another cell on the way)
         continue;
       }
-
-      snake = nextSnake;
-      push(grow, ate, level);
-
-      if (isFood) break; // retarget next food in snk order
+      // no path — wander to open space and retry
+      if (retries++ >= 8) {
+        console.warn(`stuck going to ${fk}, skipping`);
+        remaining.delete(fk);
+        return;
+      }
+      wander(12 + retries * 4);
     }
-  }
+  };
+
+  for (const food of foodOrder) chaseFood(food);
+  // second pass for anything skipped earlier
+  for (const food of foodOrder) chaseFood(food);
 
   // park above grid like snk
   const park = { x: Math.min(3, Math.max(0, width - 1)), y: -1 };
@@ -546,8 +566,8 @@ async function main() {
   console.log(`frames: ${frames.length}, max length: ${maxLen}, eats: ${eats}`);
 
   await mkdir(OUT_DIR, { recursive: true });
-  const lightPath = path.join(OUT_DIR, "snake-v5.svg");
-  const darkPath = path.join(OUT_DIR, "snake-v5-dark.svg");
+  const lightPath = path.join(OUT_DIR, "snake-v6.svg");
+  const darkPath = path.join(OUT_DIR, "snake-v6-dark.svg");
   await writeFile(lightPath, buildSvg(cells, grid, frames, PALETTES.light), "utf8");
   await writeFile(darkPath, buildSvg(cells, grid, frames, PALETTES.dark), "utf8");
   console.log(`wrote ${lightPath}`);
