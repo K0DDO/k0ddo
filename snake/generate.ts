@@ -352,8 +352,8 @@ async function main() {
   console.log(`frames: ${frames.length}, max length: ${maxLen}, eats: ${eats}`);
 
   await mkdir(OUT_DIR, { recursive: true });
-  const lightPath = path.join(OUT_DIR, "github-contribution-grid-snake.svg");
-  const darkPath = path.join(OUT_DIR, "github-contribution-grid-snake-dark.svg");
+  const lightPath = path.join(OUT_DIR, "snake.svg");
+  const darkPath = path.join(OUT_DIR, "snake-dark.svg");
   await writeFile(lightPath, buildSvg(cells, grid, frames, PALETTES.light), "utf8");
   await writeFile(darkPath, buildSvg(cells, grid, frames, PALETTES.dark), "utf8");
   console.log(`wrote ${lightPath}`);
