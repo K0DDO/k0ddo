@@ -11,59 +11,24 @@ on:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
-      - name: generate github-contribution-grid-snake.svg
-        uses: Platane/snk/svg-only@v3
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
         with:
-          github_user_name: ${{ github.repository_owner }}
-          outputs: |
-            dist/github-contribution-grid-snake.svg?color_snake=%23f5983c
-            dist/github-contribution-grid-snake-dark.svg?palette=github-dark&color_snake=%23f5983c
+          node-version: "22"
 
-      - name: apply head-to-tail gradient
-        shell: bash
-        run: |
-          python3 << 'PY'
-          from pathlib import Path
-          import re
-
-          HEAD = (0xF5, 0x98, 0x3C)  # #f5983c
-          TAIL = (0xE5, 0x5A, 0xE7)  # #e55ae7
-
-          def lerp(a, b, t):
-              return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
-
-          def to_hex(rgb):
-              return "#{:02x}{:02x}{:02x}".format(*rgb)
-
-          for path in Path("dist").glob("*.svg"):
-              svg = path.read_text(encoding="utf-8")
-              ids = sorted(
-                  {int(m.group(1)) for m in re.finditer(r'class="s s(\d+)"', svg)}
-              )
-              if not ids:
-                  print(f"skip {path.name}: no snake segments")
-                  continue
-
-              n = len(ids)
-              rules = []
-              for i, sid in enumerate(ids):
-                  t = 0 if n == 1 else i / (n - 1)
-                  color = to_hex(lerp(HEAD, TAIL, t))
-                  rules.append(f".s.s{sid}{{fill:{color}!important}}")
-                  print(f"{path.name}: s{sid} -> {color}")
-
-              injection = "".join(rules)
-              if "</style>" in svg:
-                  svg = svg.replace("</style>", injection + "</style>", 1)
-              else:
-                  svg = injection + svg
-              path.write_text(svg, encoding="utf-8")
-          PY
+      - name: generate growing snake svg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_USER: ${{ github.repository_owner }}
+        run: node snake/generate.mjs
 
       - name: push snake svg to the output branch
         uses: crazy-max/ghaction-github-pages@v3.1.0
